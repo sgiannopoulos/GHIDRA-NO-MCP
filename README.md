@@ -64,17 +64,21 @@ GHIDRA_INSTALL_DIR=/opt/ghidra uvx git+https://github.com/gxenos/GHIDRA-NO-MCP .
 |--------|-------------|
 | `-g, --ghidra-path` | Path to Ghidra installation |
 | `-v, --verbose` | Enable verbose logging |
+| `-j, --jobs` | Parallel decompiler threads (0 = auto, 1 = serial; default: auto) |
+| `--strict` | Fail loudly on errors instead of logging and continuing |
 
 ## Output
 
 | Directory/File | Description |
 |---------------|-------------|
 | `call_graph.json` | Function call graph (nodes + edges), includes function names, addresses, caller/callee counts |
-| `decompile/` | Decompiled C files (one per function), includes function name, address, callers, callees|
-| `strings.txt` | String table |
-| `imports.txt` | Import table |
-| `exports.txt` | Export table |
-| `memory/` | Memory hexdumps, 1MB chunks|
+| `decompile/` | Decompiled C files (one per function, named `<name>_<address>.c`), includes function name, address, callers, callees |
+| `strings.txt` | Discovered strings, tab-separated: `address  length  type  refs  value` (`refs` = functions that reference the string) |
+| `imports.txt` | Import table, tab-separated: `library  name  address  refs` (`refs` = functions that call the import) |
+| `exports.txt` | Export table, tab-separated: `address  name  demangled` |
+| `sections.txt` | Memory blocks with permissions and Shannon entropy (high entropy ⇒ likely packed/encrypted) |
+| `triage.txt` | Entry points and functions calling suspicious APIs (injection, persistence, network, crypto, anti-analysis) |
+| `memory/` | Memory hexdumps, 1MB chunks (executable/code blocks excluded by default; use `--all-memory`) |
 | `decompile_skipped.txt` | Skipped functions |
 | `decompile_failed.txt` | Failed functions |
 
@@ -111,8 +115,15 @@ By default, the script runs Ghidra with the default analysis options.
 | Option | Description |
 |--------|-------------|
 | `--no-memory` | Skip memory hexdump export |
+| `--all-memory` | Include executable (code) blocks in memory hexdumps (excluded by default) |
 | `--no-strings` | Skip string extraction |
 | `--no-imports` | Skip import table export |
 | `--no-exports` | Skip export table export |
-| `--decompiler-timeout` | Timeout per function in seconds (0 = unlimited, default: 0) |
+| `--decompiler-timeout` | Timeout per function in seconds (0 = unlimited, default: 60) |
 | `--max-payload` | Max decompiler payload size in MB (default: 100) |
+
+## Safety
+
+Analysis is **static** — Ghidra disassembles and decompiles the sample but never
+executes it. The loader still parses untrusted, potentially malicious input, so for
+real malware run inside a disposable VM or container as defense in depth.
