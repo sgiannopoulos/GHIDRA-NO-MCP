@@ -3,6 +3,7 @@ import logging
 import os
 import sys
 import tempfile
+from multiprocessing import cpu_count
 from pathlib import Path
 
 import pyghidra
@@ -71,10 +72,15 @@ Examples:
         help="Skip export table export",
     )
     parser.add_argument(
+        "--all-memory",
+        action="store_true",
+        help="Include executable (code) blocks in memory hexdumps (excluded by default)",
+    )
+    parser.add_argument(
         "--decompiler-timeout",
         type=int,
-        default=0,
-        help="Timeout per function in seconds (0 = unlimited, default: 0)",
+        default=60,
+        help="Timeout per function in seconds (0 = unlimited, default: 60)",
     )
     parser.add_argument(
         "--max-payload",
@@ -82,8 +88,22 @@ Examples:
         default=100,
         help="Max decompiler payload size in MB (default: 100)",
     )
+    parser.add_argument(
+        "-j",
+        "--jobs",
+        type=int,
+        default=0,
+        help="Parallel decompiler threads (0 = auto, 1 = serial; default: auto)",
+    )
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="Fail loudly on errors instead of logging and continuing",
+    )
 
     args = parser.parse_args()
+
+    jobs = args.jobs if args.jobs > 0 else min(cpu_count() or 1, 8)
 
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
@@ -143,6 +163,9 @@ Examples:
                 skip_exports=args.no_exports,
                 decompiler_timeout=args.decompiler_timeout,
                 max_payload_mb=args.max_payload,
+                jobs=jobs,
+                strict=args.strict,
+                dump_executable=args.all_memory,
             )
             exporter.export_all(output_dir)
 
