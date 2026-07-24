@@ -72,7 +72,7 @@ GHIDRA_INSTALL_DIR=/opt/ghidra uvx git+https://github.com/gxenos/GHIDRA-NO-MCP .
 | Directory/File | Description |
 |---------------|-------------|
 | `call_graph.json` | Function call graph (nodes + edges), includes function names, addresses, caller/callee counts |
-| `decompile/` | Decompiled C files (one per function, named `<name>_<address>.c`), includes function name, address, callers, callees |
+| `decompile/` | Per-function decompiled C (`<name>_<address>.c`) and direct High P-code data-flow facts (`<name>_<address>.flow.json`) |
 | `disassembly/` | Raw bytes and Ghidra instruction text for every internal function, including internal thunks |
 | `analysis-diagnostics.json` | Structured analysis, decompilation, disassembly, coverage, warning, and failure diagnostics |
 | `strings.txt` | Discovered strings, tab-separated: `address  length  type  refs  value` (`refs` = functions that reference the string) |
@@ -94,6 +94,42 @@ Each `.c` file includes metadata header:
  * callees: 0x404000
  */
 ```
+
+Each successfully decompiled function also has a matching `.flow.json`. The
+flow export records recovered parameters, direct and indirect calls, call
+arguments and their origins, branch-driving comparisons, return values, and
+explicit parameter/call-result source-to-sink relationships.
+
+```json
+{
+  "function": {"name": "route", "address": "0x401000"},
+  "calls": [
+    {
+      "target": {
+        "kind": "direct",
+        "name": "validate",
+        "address": "0x402000"
+      },
+      "arguments": [
+        {
+          "index": 0,
+          "origins": [
+            {
+              "kind": "call_result",
+              "target": {"name": "decode", "address": "0x403000"}
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
+```
+
+These are decompiler-derived, function-local facts rather than whole-program
+taint results. Memory aliasing and callee side effects are not inferred,
+unresolved indirect calls are retained explicitly, and assembly/raw bytes
+remain the ground truth.
 
 The `call_graph.json` file contains the full call graph:
 ```json

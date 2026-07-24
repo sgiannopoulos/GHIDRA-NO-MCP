@@ -20,11 +20,13 @@ class FakeDecompileResult:
         message="",
         failed_to_start=False,
         decompiled_function=None,
+        high_function=None,
     ):
         self.completed = completed
         self.message = message
         self.failed_to_start = failed_to_start
         self.decompiled_function = decompiled_function
+        self.high_function = high_function
 
     def decompileCompleted(self):
         return self.completed
@@ -38,6 +40,9 @@ class FakeDecompileResult:
     def getDecompiledFunction(self):
         return self.decompiled_function
 
+    def getHighFunction(self):
+        return self.high_function
+
 
 class FakeDecompiledFunction:
     def __init__(self, code):
@@ -45,6 +50,24 @@ class FakeDecompiledFunction:
 
     def getC(self):
         return self.code
+
+
+class FakeLocalSymbolMap:
+    def getNumParams(self):
+        return 0
+
+
+class FakeHighFunction:
+    def getPcodeOps(self):
+        return iter(())
+
+    def getLocalSymbolMap(self):
+        return FakeLocalSymbolMap()
+
+
+class FakeBrokenHighFunction:
+    def getPcodeOps(self):
+        raise RuntimeError("broken High P-code fixture")
 
 
 class FakeDecompiler:
@@ -230,6 +253,7 @@ class DecompileResultTests(unittest.TestCase):
             True,
             "prototype recovery warning",
             decompiled_function=FakeDecompiledFunction("void main(void) {}"),
+            high_function=FakeHighFunction(),
         )
         exporter = GhidraExporter(FakeProgram([]))
         exporter._thread_decompiler = lambda: FakeDecompiler(result)
@@ -249,6 +273,7 @@ class DecompileResultTests(unittest.TestCase):
                     decompile_dir,
                 )
             output = (decompile_dir / "main_00401000.c").read_text()
+            flow = json.loads((decompile_dir / "main_00401000.flow.json").read_text())
 
         self.assertEqual(
             record,
@@ -258,9 +283,56 @@ class DecompileResultTests(unittest.TestCase):
                 "main",
                 "",
                 "prototype recovery warning",
+                {
+                    "status": "exported",
+                    "file": "decompile/main_00401000.flow.json",
+                    "counts": {
+                        "calls": 0,
+                        "indirect_calls": 0,
+                        "checks": 0,
+                        "returns": 0,
+                        "flows": 0,
+                        "unresolved": 0,
+                    },
+                },
             ),
         )
         self.assertIn("void main(void)", output)
+        self.assertEqual(flow["status"], "complete")
+
+    def test_flow_failure_does_not_discard_valid_c_output(self):
+        task_module = types.ModuleType("ghidra.util.task")
+        task_module.TaskMonitor = types.SimpleNamespace(DUMMY=object())
+        result = FakeDecompileResult(
+            True,
+            decompiled_function=FakeDecompiledFunction("void main(void) {}"),
+            high_function=FakeBrokenHighFunction(),
+        )
+        exporter = GhidraExporter(FakeProgram([]))
+        exporter._thread_decompiler = lambda: FakeDecompiler(result)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            decompile_dir = Path(tmp)
+            with patch.dict(
+                sys.modules,
+                {
+                    "ghidra": types.ModuleType("ghidra"),
+                    "ghidra.util": types.ModuleType("ghidra.util"),
+                    "ghidra.util.task": task_module,
+                },
+            ):
+                record = exporter._decompile_one(
+                    (object(), "00401000", "main"),
+                    decompile_dir,
+                )
+            c_output = (decompile_dir / "main_00401000.c").read_text()
+            flow = json.loads((decompile_dir / "main_00401000.flow.json").read_text())
+
+        self.assertEqual(record[0], "exported")
+        self.assertEqual(record[5]["status"], "failed")
+        self.assertIn("void main(void)", c_output)
+        self.assertEqual(flow["status"], "failed")
+        self.assertIn("broken High P-code fixture", flow["error"])
 
 
 class DisassemblyTests(unittest.TestCase):

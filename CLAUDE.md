@@ -5,9 +5,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## What this is
 
 A headless CLI that drives Ghidra (via `pyghidra`) to decompile a binary and dump the
-results as plain text/source files — decompiled C and raw assembly per function, a call
-graph, structured diagnostics, strings, imports, exports, and memory hexdumps — for
-consumption by AI IDEs. No GUI, no MCP server; the output is just files on disk.
+results as plain text/source files — decompiled C, direct High P-code data-flow facts,
+and raw assembly per function, a call graph, structured diagnostics, strings, imports,
+exports, and memory hexdumps — for consumption by AI IDEs. No GUI, no MCP server; the
+output is just files on disk.
 
 ## Commands
 
@@ -27,13 +28,15 @@ NationalSecurityAgency/ghidra). Pure-Python and fake-program unit tests live und
 
 ## Architecture
 
-Three source files under `src/ghidra_no_mcp/`:
+Source files under `src/ghidra_no_mcp/`:
 
 - `cli.py` — argument parsing, resolves the Ghidra path, calls `pyghidra.start()`, loads the
   binary with `program_loader`, then hands the `Program` object to `GhidraExporter`.
-- `exporter.py` — `GhidraExporter` class; all the actual export logic. `export_all()` runs
+- `exporter.py` — `GhidraExporter` class; orchestration and artifact exports. `export_all()` runs
   analysis and export. `export_preanalyzed()` is the public integration API for callers
   that configure analyzers or recover functions before the exporter snapshots them.
+- `data_flow.py` — duck-typed, unit-testable extraction of direct local flow facts from
+  `DecompileResults.getHighFunction()`. It intentionally has no top-level Ghidra imports.
 - `__main__.py` / `__init__.py` — entrypoint shim and version.
 
 ### The critical pattern: lazy Ghidra imports
@@ -63,6 +66,16 @@ It then writes: `call_graph.json`, `decompile/`, `disassembly/`, strings, import
 `sections.txt` (with per-block Shannon entropy for packing detection), `triage.txt`
 (entry points + suspicious-API callers), memory, and `analysis-diagnostics.json`.
 Each text export is tab-separated with a `#` header row.
+
+Each successful function decompilation writes both `<name>_<address>.c` and
+`<name>_<address>.flow.json` from the same `DecompileResults`; never run a
+second decompilation just for flow. The flow file records local parameters,
+calls, argument origins, branch-driving checks, returns, and direct
+parameter/call-result source-to-sink facts. It deliberately stops at memory
+loads, unresolved operations, and function-call boundaries instead of claiming
+whole-program taint or memory alias analysis. A flow-specific failure must not
+discard valid C output: write a failed flow artifact and record it in
+diagnostics unless `--strict` is active.
 
 Ghidra's `DecompileResults.getErrorMessage()` may contain a warning after a successful
 decompilation. Always use `decompileCompleted()` as the completion test and record a

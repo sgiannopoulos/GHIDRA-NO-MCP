@@ -6,6 +6,8 @@ import threading
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from ghidra_no_mcp.data_flow import extract_function_flow, flow_counts
+
 if TYPE_CHECKING:
     from ghidra.app.decompiler import DecompileResults, DecompInterface
     from ghidra.program.model.listing import Program
@@ -157,6 +159,15 @@ def classify_decompile_result(result: Any) -> tuple[bool, str]:
     return False, message or "decompilation did not complete"
 
 
+def _safe_address(varnode: Any) -> Any | None:
+    if varnode is None:
+        return None
+    try:
+        return varnode.getAddress()
+    except Exception:
+        return None
+
+
 def _new_stats() -> dict[str, Any]:
     return {
         "total_functions": 0,
@@ -173,6 +184,19 @@ def _new_stats() -> dict[str, Any]:
             "external_skipped": 0,
             "instruction_count": 0,
             "instruction_bytes": 0,
+        },
+        "data_flow": {
+            "eligible": 0,
+            "attempted": 0,
+            "exported": 0,
+            "failed": 0,
+            "calls": 0,
+            "indirect_calls": 0,
+            "checks": 0,
+            "returns": 0,
+            "flows": 0,
+            "unresolved": 0,
+            "coverage": None,
         },
     }
 
@@ -485,6 +509,7 @@ class GhidraExporter:
             else:
                 to_decompile.append((func, addr, name))
 
+        self.stats["data_flow"]["eligible"] = len(to_decompile)
         logger.info(f"Exporting {len(to_decompile)} functions (jobs={self.jobs})...")
 
         try:
@@ -512,7 +537,7 @@ class GhidraExporter:
         exported = 0
         warnings = 0
         with open(failed_file, "w") as f:
-            for status, addr, name, msg, warning in results:
+            for status, addr, name, msg, warning, flow_record in results:
                 if status == "exported":
                     exported += 1
                 else:
@@ -528,19 +553,47 @@ class GhidraExporter:
                     record["error"] = msg
                 if warning:
                     record["warning"] = warning
+                if flow_record is not None:
+                    record["dataFlow"] = {
+                        key: value
+                        for key, value in flow_record.items()
+                        if key != "counts"
+                    }
+                    self.stats["data_flow"]["attempted"] += 1
+                    flow_status = flow_record.get("status")
+                    if flow_status == "exported":
+                        self.stats["data_flow"]["exported"] += 1
+                        for key, value in (flow_record.get("counts") or {}).items():
+                            if key in self.stats["data_flow"]:
+                                self.stats["data_flow"][key] += int(value)
+                    else:
+                        self.stats["data_flow"]["failed"] += 1
                 self._decompile_records.append(record)
         with open(warnings_file, "w") as f:
-            for status, addr, name, _, warning in results:
+            for status, addr, name, _, warning, _ in results:
                 if status == "exported" and warning:
                     f.write(f"{addr}:{name} - {warning}\n")
         self.stats["exported"] = exported
         self.stats["failed"] = len(results) - exported
         self.stats["warnings"] = warnings
+        flow_eligible = self.stats["data_flow"]["eligible"]
+        self.stats["data_flow"]["coverage"] = (
+            self.stats["data_flow"]["exported"] / flow_eligible
+            if flow_eligible
+            else None
+        )
 
         logger.info(f"  Decompiled: {exported} functions")
         logger.info(f"  Skipped: {len(skipped)} (external/thunk)")
         logger.info(f"  Failed: {self.stats['failed']}")
         logger.info(f"  Warnings: {warnings}")
+        logger.info(
+            "  Data flow: "
+            f"{self.stats['data_flow']['exported']}/"
+            f"{self.stats['data_flow']['attempted']} functions, "
+            f"{self.stats['data_flow']['flows']} direct flows, "
+            f"{self.stats['data_flow']['failed']} failed"
+        )
 
     def _decompile_serial(self, items: list[tuple], decompile_dir: Path) -> list[tuple]:
         results = []
@@ -578,7 +631,7 @@ class GhidraExporter:
             )
             completed, message = classify_decompile_result(result)
             if not completed:
-                return ("failed", addr, name, message, "")
+                return ("failed", addr, name, message, "", None)
 
             # Use the explicit getter (not JPype property access) and null-check:
             # a timed-out/incomplete result has no decompiled function.
@@ -590,18 +643,113 @@ class GhidraExporter:
                     name,
                     "decompilation completed but returned no C output",
                     message,
+                    None,
                 )
 
             code = str(decompiled.getC())
             content = self._build_function_file(addr, name, code)
 
-            filename = f"{sanitize_filename(name)}_{sanitize_filename(addr)}.c"
-            (decompile_dir / filename).write_text(content, encoding="utf-8")
-            return ("exported", addr, name, "", message)
+            stem = f"{sanitize_filename(name)}_{sanitize_filename(addr)}"
+            (decompile_dir / f"{stem}.c").write_text(content, encoding="utf-8")
+            flow_record = self._export_function_flow(
+                result,
+                decompile_dir / f"{stem}.flow.json",
+                addr=addr,
+                name=name,
+            )
+            return ("exported", addr, name, "", message, flow_record)
         except Exception as e:
             if self.strict:
                 raise
-            return ("failed", addr, name, str(e), "")
+            return ("failed", addr, name, str(e), "", None)
+
+    def _export_function_flow(
+        self,
+        result: "DecompileResults",
+        output_path: Path,
+        *,
+        addr: str,
+        name: str,
+    ) -> dict[str, Any]:
+        """Write the direct local flow facts from the completed decompilation.
+
+        Flow extraction is deliberately isolated from C export.  In resilient
+        mode a flow-specific failure still leaves both the C file and a
+        machine-readable failed ``.flow.json`` artifact.
+        """
+        try:
+            high_function = result.getHighFunction()
+            if high_function is None:
+                raise RuntimeError(
+                    "decompilation completed but returned no High P-code"
+                )
+            flow = extract_function_flow(
+                high_function,
+                function_name=name,
+                function_address=addr,
+                resolve_direct_call=self._resolve_direct_call,
+            )
+            output_path.write_text(
+                json.dumps(flow, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            return {
+                "status": "exported",
+                "file": f"decompile/{output_path.name}",
+                "counts": flow_counts(flow),
+            }
+        except Exception as exc:
+            if self.strict:
+                raise
+            failure = {
+                "schemaVersion": 1,
+                "status": "failed",
+                "function": {
+                    "name": name,
+                    "address": addr,
+                },
+                "error": str(exc),
+            }
+            output_path.write_text(
+                json.dumps(failure, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            return {
+                "status": "failed",
+                "file": f"decompile/{output_path.name}",
+                "error": str(exc),
+            }
+
+    def _resolve_direct_call(self, target_varnode: Any) -> dict[str, Any] | None:
+        """Resolve a High P-code CALL target using the final FunctionManager."""
+        target_address = _safe_address(target_varnode)
+        if target_address is None:
+            return None
+
+        target_text = str(target_address)
+        info = self.call_info.get(target_text)
+        if info is not None:
+            return {
+                "address": target_text,
+                "name": str(info["name"]),
+                "external": bool(info["is_external"]),
+            }
+
+        try:
+            function = self.program.getFunctionManager().getFunctionAt(target_address)
+        except Exception:
+            function = None
+        if function is not None:
+            return {
+                "address": str(function.getEntryPoint()),
+                "name": str(function.getName()),
+                "external": bool(function.isExternal()),
+            }
+        return {
+            "address": target_text,
+            "name": None,
+            "external": None,
+        }
 
     def _build_function_file(self, addr: str, name: str, code: str) -> str:
         info = self.call_info.get(addr, {})
@@ -1113,6 +1261,7 @@ class GhidraExporter:
                     ),
                 ),
             },
+            "dataFlow": dict(self.stats["data_flow"]),
             "disassembly": {
                 **self.stats["disassembly"],
                 "records": sorted(
@@ -1152,6 +1301,12 @@ class GhidraExporter:
         logger.info(f"  Skipped:         {self.stats['skipped']}")
         logger.info(f"  Failed:          {self.stats['failed']}")
         logger.info(f"  Warnings:        {self.stats['warnings']}")
+        logger.info(
+            "  Data flow:       "
+            f"{self.stats['data_flow']['exported']}/"
+            f"{self.stats['data_flow']['attempted']} functions "
+            f"({self.stats['data_flow']['flows']} direct flows)"
+        )
         logger.info(
             "  Assembly:        "
             f"{self.stats['disassembly']['exported']}/"
