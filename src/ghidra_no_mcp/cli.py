@@ -72,6 +72,11 @@ Examples:
         help="Skip export table export",
     )
     parser.add_argument(
+        "--no-disassembly",
+        action="store_true",
+        help="Skip per-function assembly export",
+    )
+    parser.add_argument(
         "--all-memory",
         action="store_true",
         help="Include executable (code) blocks in memory hexdumps (excluded by default)",
@@ -148,7 +153,7 @@ Examples:
     try:
         pyghidra.start(verbose=args.verbose, install_dir=ghidra_path)
 
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory():
             loader = program_loader()
             loader.source(str(binary_path))
             results = loader.load()
@@ -166,6 +171,7 @@ Examples:
                 jobs=jobs,
                 strict=args.strict,
                 dump_executable=args.all_memory,
+                skip_disassembly=args.no_disassembly,
             )
             exporter.export_all(output_dir)
 

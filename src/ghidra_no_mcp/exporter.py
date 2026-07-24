@@ -1,18 +1,22 @@
+import json
 import logging
 import math
 import re
 import threading
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from ghidra.app.decompiler import DecompileResults, DecompInterface
-    from ghidra.program.model.listing import Function, Program
+    from ghidra.program.model.listing import Program
     from ghidra.program.model.mem import MemoryBlock
     from ghidra.program.model.symbol import Symbol
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger(__name__)
+
+DIAGNOSTICS_FILENAME = "analysis-diagnostics.json"
+ANALYSIS_LOG_LIMIT = 32 * 1024
 
 
 # --- Pure helpers (no Ghidra/JVM dependency; unit-testable on their own) ---
@@ -22,37 +26,77 @@ logger = logging.getLogger(__name__)
 # name, so e.g. "VirtualAllocEx" matches "virtualalloc".
 SUSPICIOUS_APIS: dict[str, list[str]] = {
     "process-injection": [
-        "virtualalloc", "virtualprotect", "writeprocessmemory",
-        "createremotethread", "ntwritevirtualmemory", "queueuserapc",
-        "setthreadcontext", "mapviewofsection", "ntmapviewofsection",
-        "rtlcreateuserthread", "ntunmapviewofsection",
+        "virtualalloc",
+        "virtualprotect",
+        "writeprocessmemory",
+        "createremotethread",
+        "ntwritevirtualmemory",
+        "queueuserapc",
+        "setthreadcontext",
+        "mapviewofsection",
+        "ntmapviewofsection",
+        "rtlcreateuserthread",
+        "ntunmapviewofsection",
     ],
     "process-exec": [
-        "createprocess", "shellexecute", "winexec", "loadlibrary",
-        "getprocaddress", "ntcreateprocess", "createprocessinternal",
+        "createprocess",
+        "shellexecute",
+        "winexec",
+        "loadlibrary",
+        "getprocaddress",
+        "ntcreateprocess",
+        "createprocessinternal",
     ],
     "persistence": [
-        "regsetvalue", "regcreatekey", "createservice", "startservice",
-        "schtasks", "regsetkeyvalue",
+        "regsetvalue",
+        "regcreatekey",
+        "createservice",
+        "startservice",
+        "schtasks",
+        "regsetkeyvalue",
     ],
     "network": [
-        "wininet", "winhttp", "internetopen", "internetconnect",
-        "httpopenrequest", "httpsendrequest", "urldownloadtofile",
-        "wsastartup", "wsasocket", "wsaconnect", "wsasend", "wsarecv",
-        "closesocket", "getaddrinfo", "gethostbyname", "inet_addr",
+        "wininet",
+        "winhttp",
+        "internetopen",
+        "internetconnect",
+        "httpopenrequest",
+        "httpsendrequest",
+        "urldownloadtofile",
+        "wsastartup",
+        "wsasocket",
+        "wsaconnect",
+        "wsasend",
+        "wsarecv",
+        "closesocket",
+        "getaddrinfo",
+        "gethostbyname",
+        "inet_addr",
     ],
     "crypto": [
-        "cryptencrypt", "cryptdecrypt", "cryptacquirecontext", "cryptgenkey",
-        "bcryptencrypt", "bcryptdecrypt", "cryptderivekey",
+        "cryptencrypt",
+        "cryptdecrypt",
+        "cryptacquirecontext",
+        "cryptgenkey",
+        "bcryptencrypt",
+        "bcryptdecrypt",
+        "cryptderivekey",
     ],
     "anti-analysis": [
-        "isdebuggerpresent", "checkremotedebuggerpresent",
-        "ntqueryinformationprocess", "outputdebugstring", "gettickcount",
+        "isdebuggerpresent",
+        "checkremotedebuggerpresent",
+        "ntqueryinformationprocess",
+        "outputdebugstring",
+        "gettickcount",
         "queryperformancecounter",
     ],
     "discovery": [
-        "getcomputername", "getusername", "getadaptersinfo",
-        "createtoolhelp32snapshot", "process32first", "process32next",
+        "getcomputername",
+        "getusername",
+        "getadaptersinfo",
+        "createtoolhelp32snapshot",
+        "process32first",
+        "process32next",
     ],
 }
 
@@ -93,6 +137,46 @@ def match_suspicious(name: str) -> list[str]:
     return [cat for cat, kws in SUSPICIOUS_APIS.items() if any(k in n for k in kws)]
 
 
+def classify_decompile_result(result: Any) -> tuple[bool, str]:
+    """Return ``(completed, message)`` for a Ghidra DecompileResults object.
+
+    ``getErrorMessage()`` is not a completion flag: Ghidra may return a warning
+    there after a successful decompilation. ``decompileCompleted()`` is the
+    authoritative status check.
+    """
+    message = str(result.getErrorMessage() or "")
+    if result.decompileCompleted():
+        return True, message
+
+    if not message:
+        try:
+            if result.failedToStart():
+                message = "decompiler executable failed to start"
+        except Exception:
+            pass
+    return False, message or "decompilation did not complete"
+
+
+def _new_stats() -> dict[str, Any]:
+    return {
+        "total_functions": 0,
+        "exported": 0,
+        "skipped": 0,
+        "failed": 0,
+        "warnings": 0,
+        "memory_files": 0,
+        "memory_bytes": 0,
+        "disassembly": {
+            "attempted": 0,
+            "exported": 0,
+            "failed": 0,
+            "external_skipped": 0,
+            "instruction_count": 0,
+            "instruction_bytes": 0,
+        },
+    }
+
+
 class GhidraExporter:
     # Cap bytes read per block when estimating entropy; representative enough
     # for packing detection without re-reading huge sections.
@@ -110,6 +194,7 @@ class GhidraExporter:
         jobs: int = 1,
         strict: bool = False,
         dump_executable: bool = False,
+        skip_disassembly: bool = False,
     ):
         self.program = program
         self.skip_memory = skip_memory
@@ -121,8 +206,10 @@ class GhidraExporter:
         self.jobs = max(1, jobs)
         self.strict = strict
         self.dump_executable = dump_executable
+        self.skip_disassembly = skip_disassembly
 
-        # Populated during export_all once the program is analyzed.
+        # Populated immediately before export, after the caller's final analysis
+        # or function-recovery pass.
         self.functions: list = []
         self.call_info: dict[str, dict] = {}
 
@@ -131,14 +218,13 @@ class GhidraExporter:
         self._lock = threading.Lock()
         self._decompilers: list = []
 
-        self.stats = {
-            "total_functions": 0,
-            "exported": 0,
-            "skipped": 0,
-            "failed": 0,
-            "memory_files": 0,
-            "memory_bytes": 0,
-        }
+        self.stats = _new_stats()
+        self._analysis_log = ""
+        self._analysis_performed_by_exporter = False
+        self._export_errors: list[dict[str, str]] = []
+        self._decompile_records: list[dict[str, Any]] = []
+        self._disassembly_records: list[dict[str, Any]] = []
+        self.last_diagnostics: dict[str, Any] | None = None
 
     # --- Error handling ---
 
@@ -178,28 +264,62 @@ class GhidraExporter:
             except Exception:
                 pass
         self._decompilers = []
+        # Serial export stores its interface on the calling thread. Do not
+        # return a disposed instance if this exporter is reused.
+        if hasattr(self._tls, "decomp"):
+            del self._tls.decomp
 
     # --- Orchestration ---
 
-    def export_all(self, output_dir: Path) -> dict:
+    def analyze(self) -> str:
+        """Run Ghidra auto-analysis and return its analysis log."""
         import pyghidra
 
+        logger.info("Analyzing program...")
+        analysis_log = str(pyghidra.analyze(self.program) or "")
+        self._analysis_log = analysis_log
+        self._analysis_performed_by_exporter = True
+        logger.info("Analysis complete.")
+        return analysis_log
+
+    def export_all(self, output_dir: Path) -> dict:
+        """Analyze the program, then export all configured artifacts."""
+        self.analyze()
+        return self.export_preanalyzed(output_dir, analysis_log=self._analysis_log)
+
+    def export_preanalyzed(
+        self,
+        output_dir: Path,
+        *,
+        analysis_log: str | None = None,
+    ) -> dict:
+        """Export a program whose final analysis/recovery pass is complete.
+
+        This public entry point lets callers configure analyzers, recover
+        functions, or otherwise mutate the Ghidra Program before the exporter
+        snapshots FunctionManager. It never invokes auto-analysis itself.
+        """
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
+        self._reset_export_state()
+        if analysis_log is not None:
+            self._analysis_log = str(analysis_log)
 
         logger.info(f"Exporting to: {output_dir}")
         logger.info("-" * 50)
 
-        logger.info("Analyzing program...")
-        pyghidra.analyze(self.program)
-        logger.info("Analysis complete.")
-
         fm = self.program.getFunctionManager()
         self.functions = list(fm.getFunctions(True))
+        self.stats["total_functions"] = len(self.functions)
         self.call_info = self._build_call_info()
 
         self._run_export("Call graph", self.export_call_graph, output_dir)
         self._run_export("Functions", self.export_functions, output_dir)
+
+        if not self.skip_disassembly:
+            self._run_export("Disassembly", self.export_disassembly, output_dir)
+        else:
+            logger.info("  Disassembly: skipped")
 
         if not self.skip_strings:
             self._run_export("Strings", self.export_strings, output_dir)
@@ -224,8 +344,16 @@ class GhidraExporter:
         else:
             logger.info("  Memory: skipped")
 
+        self.export_diagnostics(output_dir)
         self._print_statistics()
-        return self.stats
+        return dict(self.stats)
+
+    def _reset_export_state(self):
+        self.stats = _new_stats()
+        self._export_errors = []
+        self._decompile_records = []
+        self._disassembly_records = []
+        self.last_diagnostics = None
 
     def _run_export(self, label: str, fn, output_dir: Path):
         """Run one export step in isolation so a failure can't abort the rest.
@@ -237,6 +365,7 @@ class GhidraExporter:
         except Exception as e:
             if self.strict:
                 raise
+            self._export_errors.append({"artifact": label, "error": str(e)})
             logger.warning(f"  {label}: FAILED ({e})")
 
     # --- Call relationships (computed once, reused everywhere) ---
@@ -340,16 +469,19 @@ class GhidraExporter:
 
         failed_file = output_dir / "decompile_failed.txt"
         skipped_file = output_dir / "decompile_skipped.txt"
+        warnings_file = output_dir / "decompile_warnings.txt"
 
         self.stats["total_functions"] = len(self.functions)
 
         to_decompile: list[tuple] = []
-        skipped: list[tuple[str, str]] = []
+        skipped: list[tuple[str, str, str]] = []
         for func in self.functions:
-            name = func.getName()
+            name = str(func.getName())
             addr = str(func.getEntryPoint())
-            if func.isExternal() or func.isThunk():
-                skipped.append((addr, name))
+            if func.isExternal():
+                skipped.append((addr, name, "external"))
+            elif func.isThunk():
+                skipped.append((addr, name, "thunk"))
             else:
                 to_decompile.append((func, addr, name))
 
@@ -364,23 +496,51 @@ class GhidraExporter:
             self._dispose_decompilers()
 
         with open(skipped_file, "w") as f:
-            for addr, name in skipped:
-                f.write(f"{addr}:{name} (external/thunk)\n")
+            for addr, name, reason in skipped:
+                f.write(f"{addr}:{name} ({reason})\n")
+                self._decompile_records.append(
+                    {
+                        "address": addr,
+                        "name": name,
+                        "status": "skipped",
+                        "reason": reason,
+                    }
+                )
         self.stats["skipped"] = len(skipped)
 
+        results.sort(key=lambda item: (item[1], item[2]))
         exported = 0
+        warnings = 0
         with open(failed_file, "w") as f:
-            for status, addr, name, msg in results:
+            for status, addr, name, msg, warning in results:
                 if status == "exported":
                     exported += 1
                 else:
                     f.write(f"{addr}:{name} - {msg}\n")
+                if warning:
+                    warnings += 1
+                record = {
+                    "address": addr,
+                    "name": name,
+                    "status": status,
+                }
+                if msg:
+                    record["error"] = msg
+                if warning:
+                    record["warning"] = warning
+                self._decompile_records.append(record)
+        with open(warnings_file, "w") as f:
+            for status, addr, name, _, warning in results:
+                if status == "exported" and warning:
+                    f.write(f"{addr}:{name} - {warning}\n")
         self.stats["exported"] = exported
         self.stats["failed"] = len(results) - exported
+        self.stats["warnings"] = warnings
 
         logger.info(f"  Decompiled: {exported} functions")
         logger.info(f"  Skipped: {len(skipped)} (external/thunk)")
         logger.info(f"  Failed: {self.stats['failed']}")
+        logger.info(f"  Warnings: {warnings}")
 
     def _decompile_serial(self, items: list[tuple], decompile_dir: Path) -> list[tuple]:
         results = []
@@ -390,7 +550,9 @@ class GhidraExporter:
                 logger.info(f"  Progress: {i}/{len(items)}")
         return results
 
-    def _decompile_parallel(self, items: list[tuple], decompile_dir: Path) -> list[tuple]:
+    def _decompile_parallel(
+        self, items: list[tuple], decompile_dir: Path
+    ) -> list[tuple]:
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
         results = []
@@ -414,26 +576,32 @@ class GhidraExporter:
             result: "DecompileResults" = decomp.decompileFunction(
                 func, self.decompiler_timeout, TaskMonitor.DUMMY
             )
-            error = result.getErrorMessage()
-            if error:
-                return ("failed", addr, name, str(error))
+            completed, message = classify_decompile_result(result)
+            if not completed:
+                return ("failed", addr, name, message, "")
 
             # Use the explicit getter (not JPype property access) and null-check:
             # a timed-out/incomplete result has no decompiled function.
             decompiled = result.getDecompiledFunction()
             if decompiled is None:
-                return ("failed", addr, name, "no decompiled output (timed out?)")
+                return (
+                    "failed",
+                    addr,
+                    name,
+                    "decompilation completed but returned no C output",
+                    message,
+                )
 
-            code = decompiled.getC()
+            code = str(decompiled.getC())
             content = self._build_function_file(addr, name, code)
 
-            filename = f"{sanitize_filename(name)}_{addr}.c"
-            (decompile_dir / filename).write_text(content)
-            return ("exported", addr, name, "")
+            filename = f"{sanitize_filename(name)}_{sanitize_filename(addr)}.c"
+            (decompile_dir / filename).write_text(content, encoding="utf-8")
+            return ("exported", addr, name, "", message)
         except Exception as e:
             if self.strict:
                 raise
-            return ("failed", addr, name, str(e))
+            return ("failed", addr, name, str(e), "")
 
     def _build_function_file(self, addr: str, name: str, code: str) -> str:
         info = self.call_info.get(addr, {})
@@ -453,6 +621,93 @@ class GhidraExporter:
 """
         return header + code
 
+    # --- Function disassembly ---
+
+    def export_disassembly(self, output_dir: Path):
+        """Export raw bytes and Ghidra's instruction text for every function body.
+
+        Internal thunks are included because their instructions can be
+        analytically important. External/imported functions have no local body
+        and are reported as skipped in diagnostics.
+        """
+        disassembly_dir = output_dir / "disassembly"
+        disassembly_dir.mkdir(parents=True, exist_ok=True)
+        listing = self.program.getListing()
+
+        internal = [func for func in self.functions if not func.isExternal()]
+        external_skipped = len(self.functions) - len(internal)
+        exported = 0
+        failed = 0
+        instruction_total = 0
+        byte_total = 0
+
+        for func in internal:
+            name = str(func.getName())
+            addr = str(func.getEntryPoint())
+            record: dict[str, Any] = {
+                "address": addr,
+                "name": name,
+                "status": "failed",
+            }
+            try:
+                lines = [
+                    f"; func-name: {name}",
+                    f"; func-address: {addr}",
+                    f"; thunk: {str(bool(func.isThunk())).lower()}",
+                    "; format: address<TAB>raw-bytes<TAB>instruction",
+                    "",
+                ]
+                instruction_count = 0
+                function_bytes = 0
+                for instruction in listing.getInstructions(func.getBody(), True):
+                    raw_bytes = [int(value) & 0xFF for value in instruction.getBytes()]
+                    raw = " ".join(f"{value:02x}" for value in raw_bytes)
+                    lines.append(f"{instruction.getAddress()}\t{raw}\t{instruction}")
+                    instruction_count += 1
+                    function_bytes += len(raw_bytes)
+
+                if instruction_count == 0:
+                    record["error"] = "function body contains no defined instructions"
+                    failed += 1
+                    self._disassembly_records.append(record)
+                    continue
+
+                filename = f"{sanitize_filename(name)}_{sanitize_filename(addr)}.asm"
+                (disassembly_dir / filename).write_text(
+                    "\n".join(lines) + "\n",
+                    encoding="utf-8",
+                )
+                record.update(
+                    {
+                        "status": "exported",
+                        "instructionCount": instruction_count,
+                        "instructionBytes": function_bytes,
+                    }
+                )
+                exported += 1
+                instruction_total += instruction_count
+                byte_total += function_bytes
+            except Exception as exc:
+                if self.strict:
+                    raise
+                record["error"] = str(exc)
+                failed += 1
+            self._disassembly_records.append(record)
+
+        self.stats["disassembly"] = {
+            "attempted": len(internal),
+            "exported": exported,
+            "failed": failed,
+            "external_skipped": external_skipped,
+            "instruction_count": instruction_total,
+            "instruction_bytes": byte_total,
+        }
+        logger.info(
+            "  Disassembly: "
+            f"{exported}/{len(internal)} functions, "
+            f"{instruction_total} instructions, {failed} failed"
+        )
+
     # --- Cross references ---
 
     def _xrefs_to(self, addr) -> list[str]:
@@ -464,7 +719,9 @@ class GhidraExporter:
             for ref in rm.getReferencesTo(addr):
                 from_addr = ref.getFromAddress()
                 f = fm.getFunctionContaining(from_addr)
-                out.append(f"{f.getName()}@{f.getEntryPoint()}" if f else str(from_addr))
+                out.append(
+                    f"{f.getName()}@{f.getEntryPoint()}" if f else str(from_addr)
+                )
         except Exception as e:
             self._handle_exc(f"xrefs to {addr}", e)
         return list(dict.fromkeys(out))
@@ -477,7 +734,9 @@ class GhidraExporter:
             for ref in symbol.getReferences():
                 from_addr = ref.getFromAddress()
                 f = fm.getFunctionContaining(from_addr)
-                out.append(f"{f.getName()}@{f.getEntryPoint()}" if f else str(from_addr))
+                out.append(
+                    f"{f.getName()}@{f.getEntryPoint()}" if f else str(from_addr)
+                )
         except Exception as e:
             self._handle_exc(f"xrefs to symbol {symbol.getName()}", e)
         return list(dict.fromkeys(out))
@@ -505,7 +764,9 @@ class GhidraExporter:
                     refs = self._xrefs_to(addr)
                     refs_str = ",".join(refs) if refs else "-"
                     svalue = escape_string_value(str(value))
-                    f.write(f"{addr}\t{data.getLength()}\t{dt_name}\t{refs_str}\t{svalue}\n")
+                    f.write(
+                        f"{addr}\t{data.getLength()}\t{dt_name}\t{refs_str}\t{svalue}\n"
+                    )
                     count += 1
                 except Exception as e:
                     self._handle_exc("string export", e)
@@ -753,6 +1014,136 @@ class GhidraExporter:
 
         return "\n".join(lines)
 
+    # --- Diagnostics ---
+
+    def _program_diagnostics(self) -> dict[str, Any]:
+        def read(getter, default="unknown"):
+            try:
+                value = getter()
+                return default if value is None else str(value)
+            except Exception:
+                return default
+
+        try:
+            from ghidra.framework import Application
+
+            ghidra_version = str(Application.getApplicationVersion())
+        except Exception:
+            ghidra_version = "unknown"
+
+        return {
+            "name": read(self.program.getName),
+            "ghidraVersion": ghidra_version,
+            "language": read(self.program.getLanguageID),
+            "compilerSpec": read(
+                lambda: self.program.getCompilerSpec().getCompilerSpecID()
+            ),
+            "executableFormat": read(self.program.getExecutableFormat),
+            "imageBase": read(self.program.getImageBase),
+        }
+
+    def build_diagnostics(self) -> dict[str, Any]:
+        """Build a JSON-serializable summary of analysis and artifact quality."""
+        internal_functions = [func for func in self.functions if not func.isExternal()]
+        external_count = len(self.functions) - len(internal_functions)
+        thunk_count = sum(1 for func in internal_functions if func.isThunk())
+
+        decompiled_addresses = {
+            record["address"]
+            for record in self._decompile_records
+            if record["status"] == "exported"
+        }
+        disassembled_addresses = {
+            record["address"]
+            for record in self._disassembly_records
+            if record["status"] == "exported"
+        }
+        if self.skip_disassembly:
+            required_addresses = {
+                str(func.getEntryPoint())
+                for func in internal_functions
+                if not func.isThunk()
+            }
+        else:
+            required_addresses = {
+                str(func.getEntryPoint()) for func in internal_functions
+            }
+        artifact_addresses = decompiled_addresses | disassembled_addresses
+        covered = len(required_addresses & artifact_addresses)
+        artifact_coverage = (
+            covered / len(required_addresses) if required_addresses else None
+        )
+        self.stats["artifact_coverage"] = artifact_coverage
+
+        diagnostics_status = (
+            "complete"
+            if not self._export_errors
+            and (artifact_coverage is None or artifact_coverage == 1.0)
+            else "degraded"
+        )
+        analysis_log = self._analysis_log[-ANALYSIS_LOG_LIMIT:]
+        return {
+            "schemaVersion": 1,
+            "status": diagnostics_status,
+            "program": self._program_diagnostics(),
+            "analysis": {
+                "performedByExporter": self._analysis_performed_by_exporter,
+                "logTruncated": len(self._analysis_log) > ANALYSIS_LOG_LIMIT,
+                "logTail": analysis_log,
+            },
+            "functions": {
+                "total": len(self.functions),
+                "internal": len(internal_functions),
+                "external": external_count,
+                "internalThunks": thunk_count,
+                "artifactCovered": covered,
+                "artifactCoverage": artifact_coverage,
+            },
+            "decompilation": {
+                "attempted": self.stats["exported"] + self.stats["failed"],
+                "exported": self.stats["exported"],
+                "failed": self.stats["failed"],
+                "skipped": self.stats["skipped"],
+                "warnings": self.stats["warnings"],
+                "records": sorted(
+                    self._decompile_records,
+                    key=lambda record: (
+                        record["address"],
+                        record["name"],
+                    ),
+                ),
+            },
+            "disassembly": {
+                **self.stats["disassembly"],
+                "records": sorted(
+                    self._disassembly_records,
+                    key=lambda record: (
+                        record["address"],
+                        record["name"],
+                    ),
+                ),
+            },
+            "artifacts": {
+                "errors": list(self._export_errors),
+            },
+        }
+
+    def export_diagnostics(self, output_dir: Path) -> dict[str, Any]:
+        diagnostics = self.build_diagnostics()
+        self.last_diagnostics = diagnostics
+        diagnostics_path = Path(output_dir) / DIAGNOSTICS_FILENAME
+        diagnostics_path.write_text(
+            json.dumps(diagnostics, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        logger.info(
+            "  Diagnostics: "
+            f"{diagnostics['status']} "
+            f"(artifact coverage="
+            f"{diagnostics['functions']['artifactCoverage']})"
+        )
+        return diagnostics
+
     def _print_statistics(self):
         logger.info("-" * 50)
         logger.info("Export Summary:")
@@ -760,5 +1151,11 @@ class GhidraExporter:
         logger.info(f"  Exported:        {self.stats['exported']}")
         logger.info(f"  Skipped:         {self.stats['skipped']}")
         logger.info(f"  Failed:          {self.stats['failed']}")
+        logger.info(f"  Warnings:        {self.stats['warnings']}")
+        logger.info(
+            "  Assembly:        "
+            f"{self.stats['disassembly']['exported']}/"
+            f"{self.stats['disassembly']['attempted']}"
+        )
         logger.info(f"  Memory files:    {self.stats['memory_files']}")
         logger.info(f"  Memory bytes:    {self.stats['memory_bytes']}")

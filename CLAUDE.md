@@ -5,9 +5,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## What this is
 
 A headless CLI that drives Ghidra (via `pyghidra`) to decompile a binary and dump the
-results as plain text/source files — decompiled C per function, a call graph, strings,
-imports, exports, and memory hexdumps — for consumption by AI IDEs. No GUI, no MCP server;
-the output is just files on disk.
+results as plain text/source files — decompiled C and raw assembly per function, a call
+graph, structured diagnostics, strings, imports, exports, and memory hexdumps — for
+consumption by AI IDEs. No GUI, no MCP server; the output is just files on disk.
 
 ## Commands
 
@@ -22,8 +22,8 @@ uv run ghidra-no-mcp -g /path/to/ghidra ./binary ./output_dir -v
 ```
 
 Requires Python >= 3.12 and a local Ghidra installation (not bundled; download from
-NationalSecurityAgency/ghidra). There is **no test suite, linter config, or CI** in this
-repo — to validate a change, run the tool against a real binary and inspect `output_dir`.
+NationalSecurityAgency/ghidra). Pure-Python and fake-program unit tests live under
+`tests/`; changes to Ghidra-facing behavior must also be validated against a real binary.
 
 ## Architecture
 
@@ -32,7 +32,8 @@ Three source files under `src/ghidra_no_mcp/`:
 - `cli.py` — argument parsing, resolves the Ghidra path, calls `pyghidra.start()`, loads the
   binary with `program_loader`, then hands the `Program` object to `GhidraExporter`.
 - `exporter.py` — `GhidraExporter` class; all the actual export logic. `export_all()` runs
-  `pyghidra.analyze()` first, then writes each artifact.
+  analysis and export. `export_preanalyzed()` is the public integration API for callers
+  that configure analyzers or recover functions before the exporter snapshots them.
 - `__main__.py` / `__init__.py` — entrypoint shim and version.
 
 ### The critical pattern: lazy Ghidra imports
@@ -52,14 +53,20 @@ wrap them in `str(...)` before using as Python strings/dict keys, as the existin
 
 ### Export flow and resilience
 
-`export_all()` first runs `pyghidra.analyze()`, then builds `self.call_info` (a plain-Python
+`export_all()` first runs `pyghidra.analyze()`, then delegates to
+`export_preanalyzed()`. The latter builds `self.call_info` (a plain-Python
 map of every function's callers/callees) **once** via `_build_call_info()`, which both the call
 graph and the per-function `.c` headers read from. This is the single place that calls Ghidra's
 `getCalledFunctions(monitor)` / `getCallingFunctions(monitor)` — **these require a `TaskMonitor`
 argument**; calling them with none (the historical bug) silently produced an empty call graph.
-It then writes: `call_graph.json`, `decompile/`, strings, imports, exports, `sections.txt`
-(with per-block Shannon entropy for packing detection), `triage.txt` (entry points +
-suspicious-API callers), and memory. Each text export is tab-separated with a `#` header row.
+It then writes: `call_graph.json`, `decompile/`, `disassembly/`, strings, imports, exports,
+`sections.txt` (with per-block Shannon entropy for packing detection), `triage.txt`
+(entry points + suspicious-API callers), memory, and `analysis-diagnostics.json`.
+Each text export is tab-separated with a `#` header row.
+
+Ghidra's `DecompileResults.getErrorMessage()` may contain a warning after a successful
+decompilation. Always use `decompileCompleted()` as the completion test and record a
+non-empty message as a warning when completion is true.
 
 Errors are routed through `_handle_exc()`: by default logged at debug and skipped; with
 `--strict` they re-raise (fail-loud for debugging a specific sample). Per-function decompile

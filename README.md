@@ -73,6 +73,8 @@ GHIDRA_INSTALL_DIR=/opt/ghidra uvx git+https://github.com/gxenos/GHIDRA-NO-MCP .
 |---------------|-------------|
 | `call_graph.json` | Function call graph (nodes + edges), includes function names, addresses, caller/callee counts |
 | `decompile/` | Decompiled C files (one per function, named `<name>_<address>.c`), includes function name, address, callers, callees |
+| `disassembly/` | Raw bytes and Ghidra instruction text for every internal function, including internal thunks |
+| `analysis-diagnostics.json` | Structured analysis, decompilation, disassembly, coverage, warning, and failure diagnostics |
 | `strings.txt` | Discovered strings, tab-separated: `address  length  type  refs  value` (`refs` = functions that reference the string) |
 | `imports.txt` | Import table, tab-separated: `library  name  address  refs` (`refs` = functions that call the import) |
 | `exports.txt` | Export table, tab-separated: `address  name  demangled` |
@@ -81,6 +83,7 @@ GHIDRA_INSTALL_DIR=/opt/ghidra uvx git+https://github.com/gxenos/GHIDRA-NO-MCP .
 | `memory/` | Memory hexdumps, 1MB chunks (executable/code blocks excluded by default; use `--all-memory`) |
 | `decompile_skipped.txt` | Skipped functions |
 | `decompile_failed.txt` | Failed functions |
+| `decompile_warnings.txt` | Successfully decompiled functions that also returned a Ghidra warning |
 
 Each `.c` file includes metadata header:
 ```c
@@ -119,8 +122,33 @@ By default, the script runs Ghidra with the default analysis options.
 | `--no-strings` | Skip string extraction |
 | `--no-imports` | Skip import table export |
 | `--no-exports` | Skip export table export |
+| `--no-disassembly` | Skip per-function assembly export |
 | `--decompiler-timeout` | Timeout per function in seconds (0 = unlimited, default: 60) |
 | `--max-payload` | Max decompiler payload size in MB (default: 100) |
+
+### Exporting a pre-analyzed program
+
+Integrations that configure analyzers or recover additional functions can export
+the final `Program` without triggering a second auto-analysis pass:
+
+```python
+import pyghidra
+from ghidra_no_mcp.exporter import GhidraExporter
+
+analysis_log = pyghidra.analyze(program)
+
+# Apply any integration-specific recovery or program mutations here.
+
+exporter = GhidraExporter(program, jobs=4)
+stats = exporter.export_preanalyzed(
+    output_dir,
+    analysis_log=analysis_log,
+)
+```
+
+`export_all(output_dir)` remains the convenience API for ordinary callers and
+is equivalent to running `exporter.analyze()` followed by
+`exporter.export_preanalyzed(output_dir)`.
 
 ## Safety
 
